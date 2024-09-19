@@ -1,47 +1,49 @@
 import boto3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Initialize EC2 client
 ec2 = boto3.client('ec2')
 
-# Get all EBS Snapshots
-response = ec2.describe_snapshots(OwnerIds=['self'])
+def lambda_handler(event, context):
+    # Get all EBS Snapshots
+    response = ec2.describe_snapshots(OwnerIds=['self'])
 
-# Get all running EC2 instances
-instances = ec2.describe_instances(
-    Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
-active_instance_ids = set()
+    # Define the age limit for snapshots (e.g., 1 days) with UTC timezone
+   # age_limit = datetime.now(timezone.utc) - timedelta(days=1)
 
-# Collect active instance IDs
-for reservation in instances['Reservations']:
-    for instance in reservation['Instances']:
-        active_instance_ids.add(instance['InstanceId'])
+    deleted_snapshots = []
 
-# Define the age limit for snapshots (e.g., 30 days)
-age_limit = datetime.now() - timedelta(days=30)
+    # Loop through all snapshots
+    for snapshot in response['Snapshots']:
+        snapshot_id = snapshot['SnapshotId']
+        volume_id = snapshot.get('VolumeId')
+        start_time = snapshot['StartTime']  # When the snapshot was created (timezone-aware)
 
-# Loop through all snapshots
-for snapshot in response['Snapshots']:
-    snapshot_id = snapshot['SnapshotId']
-    volume_id = snapshot.get('VolumeId')
-    start_time = snapshot['StartTime']  # When the snapshot was created
-
-    # Only process snapshots older than the defined age limit
-    if start_time < age_limit:
-        # If the snapshot is not attached to any volume, delete it
+        # Only process snapshots older than the defined age limit
+       # if start_time < age_limit:
         if not volume_id:
-            ec2.delete_snapshot(SnapshotId=snapshot_id)
-            print(f"Deleted EBS snapshot {snapshot_id} as it was not attached to any volume and is older than 30 days.")
+                # If no volume ID is found, delete the snapshot
+                ec2.delete_snapshot(SnapshotId=snapshot_id)
+                deleted_snapshots.append(snapshot_id)
+                print(f"Deleted EBS snapshot {snapshot_id} as it was not attached to any volume and is older than 30 days.")
         else:
-            try:
-                # Get details of the volume
-                volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
-                # If the volume is not attached to any instance, delete the snapshot
-                if not volume_response['Volumes'][0]['Attachments']:
-                    ec2.delete_snapshot(SnapshotId=snapshot_id)
-                    print(f"Deleted EBS snapshot {snapshot_id} as it was taken from volume not attached to any instance and is older than 30 days.")
-            except ec2.exceptions.ClientError as e:
-                # Handle the case where the volume doesn't exist
-                if e.response['Error']['Code'] == 'InvalidVolume.NotFound':
-                    ec2.delete_snapshot(SnapshotId=snapshot_id)
-                    print(f"Deleted EBS Snapshot {snapshot_id} as its associated volume was not found and it is older than 30 days.")
+                try:
+                    # Try to describe the volume
+                    volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
+                    # If the volume is not attached to any instance, delete the snapshot
+                    if not volume_response['Volumes'][0]['Attachments']:
+                        ec2.delete_snapshot(SnapshotId=snapshot_id)
+                        deleted_snapshots.append(snapshot_id)
+                        print(f"Deleted EBS snapshot {snapshot_id} as it was taken from a volume not attached to any instance and is older than 30 days.")
+                except ec2.exceptions.ClientError as e:
+                    # If volume does not exist (InvalidVolume.NotFound), delete the snapshot
+                    if e.response['Error']['Code'] == 'InvalidVolume.NotFound':
+                        ec2.delete_snapshot(SnapshotId=snapshot_id)
+                        deleted_snapshots.append(snapshot_id)
+                        print(f"Deleted EBS snapshot {snapshot_id} as its associated volume was deleted and it is older than 30 days.")
+    
+    # Return the response
+    return {
+        "statusCode": 200,
+        "body": f"Deleted Snapshots: {deleted_snapshots}" if deleted_snapshots else "No snapshots deleted."
+    }
